@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAuthServer } from "@/src/lib/authoption";
-import { readFile } from "fs/promises";
-import path from "path";
+import { supabaseAdmin } from "@/src/lib/supabase";
 
 export const runtime = "nodejs";
 
@@ -11,6 +10,7 @@ export async function GET(
 ) {
   const session = await getAuthServer();
 
+  // Must be logged in
   if (!session?.user) {
     return new NextResponse("Unauthorized", {
       status: 401,
@@ -27,23 +27,33 @@ export async function GET(
       });
     }
 
-    // Prevent path traversal
+    // Prevent invalid IDs / path traversal
     if (!/^[a-f0-9-]+$/i.test(id)) {
       return new NextResponse("Invalid file", {
         status: 400,
       });
     }
 
-    const filePath = path.join(
-      process.cwd(),
-      "uploads",
-      "resumes",
-      `${id}.pdf`
-    );
+    // File path inside Supabase Storage
+    const storagePath = `resumes/${id}.pdf`;
 
-    const file = await readFile(filePath);
+    // Download file from private Supabase bucket
+    const { data, error } = await supabaseAdmin.storage
+      .from("resumes")
+      .download(storagePath);
 
-    return new NextResponse(file, {
+    if (error || !data) {
+      console.error("Supabase resume download error:", error);
+
+      return new NextResponse("Resume not found", {
+        status: 404,
+      });
+    }
+
+    // Convert Blob to ArrayBuffer
+    const arrayBuffer = await data.arrayBuffer();
+
+    return new NextResponse(arrayBuffer, {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
