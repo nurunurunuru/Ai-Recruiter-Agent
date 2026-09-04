@@ -32,18 +32,32 @@ export function RecruiterVoiceAgent({
   const [transcript, setTranscript] = useState<string[]>([]);
   const [volume, setVolume] = useState(1);
   const [sdkReady, setSdkReady] = useState(false);
-  const [silenceSecondsLeft, setSilenceSecondsLeft] = useState<number | null>(null);
+  const [silenceSecondsLeft, setSilenceSecondsLeft] = useState<number | null>(
+    null
+  );
   const [securityMessage, setSecurityMessage] = useState<string | null>(null);
+
+  // Camera states
+  const [cameraReady, setCameraReady] = useState(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraStarting, setCameraStarting] = useState(false);
+
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
 
   const silenceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const silenceStartedAtRef = useRef<number | null>(null);
   const securityViolationRef = useRef(false);
+
   const vapiInstanceRef = useRef<{
     start: (id: string, overrides?: Record<string, unknown>) => Promise<void>;
     stop: () => Promise<void>;
     send: (message: {
       type: "add-message";
-      message: { role: "system" | "user" | "assistant"; content: string };
+      message: {
+        role: "system" | "user" | "assistant";
+        content: string;
+      };
     }) => void;
     on: (event: string, cb: (...args: unknown[]) => void) => void;
   } | null>(null);
@@ -52,7 +66,100 @@ export function RecruiterVoiceAgent({
   const defaultAssistantId = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID;
   const assistantIdToUse = assistantId || defaultAssistantId;
 
-  // Dynamically import the Vapi SDK
+  /* =====================================================
+     CAMERA FUNCTIONS
+  ===================================================== */
+
+  const stopCamera = useCallback(() => {
+    if (cameraStreamRef.current) {
+      cameraStreamRef.current.getTracks().forEach((track) => {
+        track.stop();
+      });
+
+      cameraStreamRef.current = null;
+    }
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+
+    setCameraReady(false);
+  }, []);
+
+  const startCamera = useCallback(async (): Promise<boolean> => {
+    try {
+      setCameraStarting(true);
+      setCameraError(null);
+
+      // Stop previous stream if any
+      if (cameraStreamRef.current) {
+        cameraStreamRef.current.getTracks().forEach((track) => track.stop());
+        cameraStreamRef.current = null;
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: {
+            ideal: 1280,
+          },
+          height: {
+            ideal: 720,
+          },
+        },
+        audio: false,
+      });
+
+      cameraStreamRef.current = stream;
+
+      // Wait until React renders the video element
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+
+        try {
+          await videoRef.current.play();
+        } catch (error) {
+          console.warn("Video autoplay warning:", error);
+        }
+      }
+
+      setCameraReady(true);
+      setCameraStarting(false);
+
+      return true;
+    } catch (error) {
+      console.error("Camera access failed:", error);
+
+      let message =
+        "Camera access is required to start the AI interview.";
+
+      if (error instanceof DOMException) {
+        if (error.name === "NotAllowedError") {
+          message =
+            "Camera permission was denied. Please allow camera access and try again.";
+        } else if (error.name === "NotFoundError") {
+          message =
+            "No camera was found on this device. A working camera is required.";
+        } else if (error.name === "NotReadableError") {
+          message =
+            "Your camera is currently being used by another application.";
+        }
+      }
+
+      setCameraError(message);
+      setCameraReady(false);
+      setCameraStarting(false);
+
+      return false;
+    }
+  }, []);
+
+  /* =====================================================
+     LOAD VAPI SDK
+  ===================================================== */
+
   useEffect(() => {
     let mounted = true;
 
@@ -62,8 +169,10 @@ export function RecruiterVoiceAgent({
         const Vapi = VapiModule.default ?? VapiModule;
 
         if (mounted && typeof window !== "undefined") {
-          // Store the Vapi class so we can instantiate it later
-          (window as unknown as Record<string, unknown>).__VapiClass = Vapi;
+          (
+            window as unknown as Record<string, unknown>
+          ).__VapiClass = Vapi;
+
           setSdkReady(true);
         }
       } catch (err) {
@@ -75,55 +184,120 @@ export function RecruiterVoiceAgent({
 
     return () => {
       mounted = false;
+
       clearSilenceTimer();
+
       if (vapiInstanceRef.current) {
         vapiInstanceRef.current.stop().catch(() => {});
         vapiInstanceRef.current = null;
       }
+
+      stopCamera();
     };
-  }, []);
+  }, [stopCamera]);
+
+  /* =====================================================
+     SILENCE TIMER
+  ===================================================== */
 
   const clearSilenceTimer = useCallback(() => {
     if (silenceTimerRef.current) {
       clearInterval(silenceTimerRef.current);
       silenceTimerRef.current = null;
     }
+
     silenceStartedAtRef.current = null;
     setSilenceSecondsLeft(null);
   }, []);
 
-  const startSilenceTimer = useCallback((vapi: {
-    send: (message: {
-      type: "add-message";
-      message: { role: "system"; content: string };
-    }) => void;
-  }) => {
-    clearSilenceTimer();
-    silenceStartedAtRef.current = Date.now();
-    setSilenceSecondsLeft(10);
+  const startSilenceTimer = useCallback(
+    (vapi: {
+      send: (message: {
+        type: "add-message";
+        message: {
+          role: "system";
+          content: string;
+        };
+      }) => void;
+    }) => {
+      clearSilenceTimer();
 
-    silenceTimerRef.current = setInterval(() => {
-      const startedAt = silenceStartedAtRef.current;
-      if (!startedAt) return;
+      silenceStartedAtRef.current = Date.now();
+      setSilenceSecondsLeft(10);
 
-      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
-      const remaining = Math.max(0, 10 - elapsed);
-      setSilenceSecondsLeft(remaining);
+      silenceTimerRef.current = setInterval(() => {
+        const startedAt = silenceStartedAtRef.current;
 
-      if (remaining <= 0) {
-        clearSilenceTimer();
+        if (!startedAt) return;
 
-        vapi.send({
-          type: "add-message",
-          message: {
-            role: "system",
-            content:
-              "The candidate has been silent for 10 seconds after your last interview question. Do not wait any longer. If the candidate has not answered, politely move to the next unanswered interview question. Do not repeat the previous question. If there are no questions left, conclude the interview professionally.",
-          },
-        });
+        const elapsed = Math.floor(
+          (Date.now() - startedAt) / 1000
+        );
+
+        const remaining = Math.max(0, 10 - elapsed);
+
+        setSilenceSecondsLeft(remaining);
+
+        if (remaining <= 0) {
+          clearSilenceTimer();
+
+          vapi.send({
+            type: "add-message",
+            message: {
+              role: "system",
+              content:
+                "The candidate has been silent for 10 seconds after your last interview question. Do not wait any longer. If the candidate has not answered, politely move to the next unanswered interview question. Do not repeat the previous question. If there are no questions left, conclude the interview professionally.",
+            },
+          });
+        }
+      }, 250);
+    },
+    [clearSilenceTimer]
+  );
+
+  /* =====================================================
+     SECURITY VIOLATION
+  ===================================================== */
+
+  const cancelForSecurityViolation = useCallback(
+    async (reason?: string) => {
+      if (securityViolationRef.current) return;
+
+      securityViolationRef.current = true;
+
+      clearSilenceTimer();
+
+      setStatus("error");
+
+      const finalReason =
+        reason ||
+        "Interview cancelled because you left the interview page or opened another browser tab/window. You cannot resume this interview.";
+
+      try {
+        if (vapiInstanceRef.current) {
+          await vapiInstanceRef.current.stop();
+        }
+      } catch (error) {
+        console.error(
+          "Failed to stop interview after security violation:",
+          error
+        );
+      } finally {
+        vapiInstanceRef.current = null;
+
+        stopCamera();
+
+        setSecurityMessage(finalReason);
+
+        onSecurityViolation?.(finalReason);
       }
-    }, 250);
-  }, [clearSilenceTimer]);
+    },
+    [clearSilenceTimer, onSecurityViolation, stopCamera]
+  );
+
+  /* =====================================================
+     START CALL
+  ===================================================== */
 
   const startCall = useCallback(async () => {
     if (!apiKey) {
@@ -131,37 +305,77 @@ export function RecruiterVoiceAgent({
       console.error("Vapi API key not configured");
       return;
     }
+
     if (!assistantIdToUse) {
       setStatus("error");
       console.error("Vapi assistant ID not configured");
       return;
     }
 
-    const VapiClass = (window as unknown as Record<string, unknown>)
-      .__VapiClass as new (key: string) => {
-      start: (id: string, overrides?: Record<string, unknown>) => Promise<void>;
-      stop: () => Promise<void>;
-      send: (message: {
-        type: "add-message";
-        message: { role: "system" | "user" | "assistant"; content: string };
-      }) => void;
-      on: (event: string, cb: (...args: unknown[]) => void) => void;
-    };
-
-    if (!VapiClass) {
+    if (!sdkReady) {
       setStatus("error");
       console.error("Vapi SDK not loaded yet");
       return;
     }
 
+    const VapiClass = (
+      window as unknown as Record<string, unknown>
+    ).__VapiClass as
+      | (new (key: string) => {
+          start: (
+            id: string,
+            overrides?: Record<string, unknown>
+          ) => Promise<void>;
+          stop: () => Promise<void>;
+          send: (message: {
+            type: "add-message";
+            message: {
+              role: "system" | "user" | "assistant";
+              content: string;
+            };
+          }) => void;
+          on: (event: string, cb: (...args: unknown[]) => void) => void;
+        })
+      | undefined;
+
+    if (!VapiClass) {
+      setStatus("error");
+      console.error("Vapi SDK class not loaded yet");
+      return;
+    }
+
     try {
       setStatus("connecting");
+
       securityViolationRef.current = false;
+
       setSecurityMessage(null);
+
       clearSilenceTimer();
+
+      /*
+        CAMERA MUST START FIRST
+      */
+
+      const cameraStarted = await startCamera();
+
+      if (!cameraStarted) {
+        setStatus("idle");
+        return;
+      }
+
+      /*
+        CREATE DATABASE CALL
+      */
+
       await onCallStart?.();
 
+      /*
+        START VAPI
+      */
+
       const vapiInstance = new VapiClass(apiKey);
+
       vapiInstanceRef.current = vapiInstance;
 
       vapiInstance.on("call-start", () => {
@@ -170,15 +384,25 @@ export function RecruiterVoiceAgent({
 
       vapiInstance.on("call-end", () => {
         clearSilenceTimer();
-        setStatus(securityViolationRef.current ? "error" : "idle");
+
+        stopCamera();
+
+        setStatus(
+          securityViolationRef.current ? "error" : "idle"
+        );
+
         onCallEnd?.();
+
         vapiInstanceRef.current = null;
       });
 
-      // Vapi's speech-start event is emitted when the candidate starts speaking.
-      // Any candidate speech cancels the 10-second unanswered-question timer.
+      /*
+        CANDIDATE STARTS SPEAKING
+      */
+
       vapiInstance.on("speech-start", () => {
         clearSilenceTimer();
+
         setStatus("listening");
       });
 
@@ -186,24 +410,45 @@ export function RecruiterVoiceAgent({
         setStatus("listening");
       });
 
+      /*
+        TRANSCRIPT + AI QUESTION DETECTION
+      */
+
       vapiInstance.on("message", (message: unknown) => {
         const msg = message as Record<string, unknown>;
 
         if (msg.type === "transcript" && msg.transcript) {
-          const role = msg.role === "assistant" ? "Recruiter" : "Candidate";
+          const role =
+            msg.role === "assistant"
+              ? "Recruiter"
+              : "Candidate";
+
           const transcriptType = msg.transcriptType;
+
           const text = String(msg.transcript).trim();
 
-          // Only store final transcript turns so partial transcripts don't
-          // duplicate the interview transcript.
-          if (transcriptType === "final" || transcriptType === undefined) {
-            setTranscript((prev) => [...prev, `${role}: ${text}`]);
+          if (
+            transcriptType === "final" ||
+            transcriptType === undefined
+          ) {
+            setTranscript((prev) => [
+              ...prev,
+              `${role}: ${text}`,
+            ]);
           }
 
-          // When the AI finishes an utterance/question, start a 10-second
-          // candidate-response timer. Candidate speech cancels this timer.
-          if (msg.role === "assistant" && (transcriptType === "final" || transcriptType === undefined)) {
+          /*
+            AI FINISHED SPEAKING
+            START 10 SECOND TIMER
+          */
+
+          if (
+            msg.role === "assistant" &&
+            (transcriptType === "final" ||
+              transcriptType === undefined)
+          ) {
             startSilenceTimer(vapiInstance);
+
             setStatus("listening");
           }
         }
@@ -211,26 +456,37 @@ export function RecruiterVoiceAgent({
 
       vapiInstance.on("error", () => {
         clearSilenceTimer();
+
         setStatus("error");
+
+        stopCamera();
       });
 
       await vapiInstance.start(assistantIdToUse, {
         variableValues: {
           candidateName,
+
           jobTitle,
+
           questions:
             questions && questions.length > 0
-              ? questions.map((q, i) => `${i + 1}. ${q}`).join("\n")
+              ? questions
+                  .map((q, i) => `${i + 1}. ${q}`)
+                  .join("\n")
               : "Ask general questions about the candidate's background and fit for the role.",
         },
       });
     } catch (error) {
       console.error("Failed to start call:", error);
+
+      stopCamera();
+
       setStatus("error");
     }
   }, [
     apiKey,
     assistantIdToUse,
+    sdkReady,
     candidateName,
     jobTitle,
     questions,
@@ -238,42 +494,68 @@ export function RecruiterVoiceAgent({
     onCallEnd,
     clearSilenceTimer,
     startSilenceTimer,
+    startCamera,
+    stopCamera,
   ]);
 
-  const cancelForSecurityViolation = useCallback(async () => {
-    if (securityViolationRef.current) return;
-
-    securityViolationRef.current = true;
-    clearSilenceTimer();
-    setStatus("error");
-
-    try {
-      if (vapiInstanceRef.current) {
-        await vapiInstanceRef.current.stop();
-      }
-    } catch (error) {
-      console.error("Failed to stop interview after security violation:", error);
-    } finally {
-      vapiInstanceRef.current = null;
-      const reason =
-        "Interview cancelled because you left the interview page or opened another browser tab/window. You cannot resume this interview.";
-      setSecurityMessage(reason);
-      onSecurityViolation?.(reason);
-    }
-  }, [clearSilenceTimer, onSecurityViolation]);
+  /* =====================================================
+     TAB SWITCH DETECTION
+  ===================================================== */
 
   useEffect(() => {
     const handleVisibilityChange = () => {
-      if (document.visibilityState === "hidden" && vapiInstanceRef.current) {
-        void cancelForSecurityViolation();
+      if (
+        document.visibilityState === "hidden" &&
+        vapiInstanceRef.current
+      ) {
+        void cancelForSecurityViolation(
+          "Interview cancelled because you left the interview page or opened another browser tab/window. You cannot resume this interview."
+        );
       }
     };
 
-    document.addEventListener("visibilitychange", handleVisibilityChange);
+    document.addEventListener(
+      "visibilitychange",
+      handleVisibilityChange
+    );
+
     return () => {
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      document.removeEventListener(
+        "visibilitychange",
+        handleVisibilityChange
+      );
     };
   }, [cancelForSecurityViolation]);
+
+  /* =====================================================
+     CAMERA SECURITY MONITORING
+  ===================================================== */
+
+  useEffect(() => {
+    const checkCamera = () => {
+      if (
+        vapiInstanceRef.current &&
+        cameraStreamRef.current
+      ) {
+        const videoTrack =
+          cameraStreamRef.current.getVideoTracks()[0];
+
+        if (!videoTrack || videoTrack.readyState === "ended") {
+          void cancelForSecurityViolation(
+            "Interview cancelled because the required camera was turned off or disconnected."
+          );
+        }
+      }
+    };
+
+    const interval = setInterval(checkCamera, 1000);
+
+    return () => clearInterval(interval);
+  }, [cancelForSecurityViolation]);
+
+  /* =====================================================
+     STOP CALL
+  ===================================================== */
 
   const stopCall = useCallback(async () => {
     try {
@@ -283,19 +565,33 @@ export function RecruiterVoiceAgent({
         await vapiInstanceRef.current.stop();
       }
 
+      stopCamera();
+
       if (securityViolationRef.current) return;
 
       setStatus("idle");
+
       onCallEnd?.();
+
       if (transcript.length > 0) {
         onCallComplete?.(transcript.join("\n"));
       }
     } catch (error) {
       console.error("Failed to stop call:", error);
-    }
-  }, [clearSilenceTimer, onCallEnd, onCallComplete, transcript]);
 
-  const isActive = status !== "idle" && status !== "error";
+      stopCamera();
+    }
+  }, [
+    clearSilenceTimer,
+    onCallEnd,
+    onCallComplete,
+    transcript,
+    stopCamera,
+  ]);
+
+  const isActive =
+    status !== "idle" &&
+    status !== "error";
 
   return (
     <div
@@ -304,74 +600,201 @@ export function RecruiterVoiceAgent({
         className
       )}
     >
-      {/* Header */}
+      {/* HEADER */}
+
       <div className="px-6 py-4 border-b border-gray-100">
         <div className="flex items-center justify-between">
           <div>
             <h3 className="text-lg font-semibold text-gray-900">
-              AI Recruiter Voice Agent
+              AI Recruiter Video Interview
             </h3>
+
             <p className="text-sm text-gray-500 mt-0.5">
               Screening {candidateName} for {jobTitle}
             </p>
           </div>
+
           <div className="flex items-center gap-3">
+            {/* CAMERA STATUS */}
+
+            <div className="flex items-center gap-2">
+              <span
+                className={cn(
+                  "w-2.5 h-2.5 rounded-full",
+                  cameraReady
+                    ? "bg-red-500 animate-pulse"
+                    : "bg-gray-400"
+                )}
+              />
+
+              <span className="text-xs font-medium text-gray-600">
+                {cameraReady
+                  ? "Camera ON"
+                  : "Camera OFF"}
+              </span>
+            </div>
+
+            {/* VOICE STATUS */}
+
             <div className="flex items-center gap-2">
               <span
                 className={cn(
                   "w-2 h-2 rounded-full",
-                  status === "idle" && "bg-gray-400",
-                  status === "connecting" && "bg-yellow-400 animate-pulse",
-                  status === "speaking" && "bg-green-500 animate-pulse",
-                  status === "listening" && "bg-blue-500 animate-pulse",
-                  status === "error" && "bg-red-500"
+                  status === "idle" &&
+                    "bg-gray-400",
+
+                  status === "connecting" &&
+                    "bg-yellow-400 animate-pulse",
+
+                  status === "speaking" &&
+                    "bg-green-500 animate-pulse",
+
+                  status === "listening" &&
+                    "bg-blue-500 animate-pulse",
+
+                  status === "error" &&
+                    "bg-red-500"
                 )}
               />
+
               <span className="text-xs font-medium text-gray-600 capitalize">
                 {status === "connecting"
                   ? "Connecting..."
                   : status === "speaking"
-                  ? "Speaking"
+                  ? "AI Speaking"
                   : status === "listening"
                   ? "Listening"
                   : status === "error"
                   ? "Error"
-                  : "Idle"}
+                  : "Ready"}
               </span>
             </div>
           </div>
         </div>
       </div>
 
+      {/* SECURITY MESSAGE */}
+
       {securityMessage && (
         <div className="px-6 py-4 bg-red-50 border-b border-red-200">
-          <p className="text-sm font-semibold text-red-800">Interview Cancelled</p>
-          <p className="text-xs text-red-700 mt-1">{securityMessage}</p>
-        </div>
-      )}
-
-      {/* Job-specific question preview */}
-      {questions && questions.length > 0 && status === "idle" && (
-        <div className="px-6 py-4 bg-gray-50 border-b border-gray-100">
-          <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">
-            This interview will cover {questions.length} question{questions.length !== 1 ? "s" : ""}
+          <p className="text-sm font-semibold text-red-800">
+            Interview Cancelled
           </p>
-          <ol className="text-sm text-gray-600 space-y-1 list-decimal list-inside">
-            {questions.map((q, i) => (
-              <li key={i}>{q}</li>
-            ))}
-          </ol>
+
+          <p className="text-xs text-red-700 mt-1">
+            {securityMessage}
+          </p>
         </div>
       )}
 
-      {/* Visualizer */}
+      {/* CAMERA ERROR */}
+
+      {cameraError && (
+        <div className="px-6 py-4 bg-red-50 border-b border-red-200">
+          <p className="text-sm font-semibold text-red-800">
+            Camera Required
+          </p>
+
+          <p className="text-xs text-red-700 mt-1">
+            {cameraError}
+          </p>
+        </div>
+      )}
+
+      {/* VIDEO INTERVIEW AREA */}
+
+      <div className="bg-gray-950 p-4">
+        <div className="relative w-full aspect-video max-h-[420px] rounded-xl overflow-hidden bg-black flex items-center justify-center">
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className={cn(
+              "w-full h-full object-cover transform scale-x-[-1]",
+              !cameraReady && "hidden"
+            )}
+          />
+
+          {!cameraReady && (
+            <div className="text-center text-gray-400 px-6">
+              <svg
+                className="w-14 h-14 mx-auto mb-3 opacity-60"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={1.5}
+                  d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M4 6h11a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z"
+                />
+              </svg>
+
+              <p className="text-sm">
+                Your camera will turn on when the interview starts.
+              </p>
+            </div>
+          )}
+
+          {/* LIVE INDICATOR */}
+
+          {cameraReady && (
+            <div className="absolute top-4 left-4 flex items-center gap-2 bg-black/60 text-white px-3 py-1.5 rounded-full">
+              <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+
+              <span className="text-xs font-semibold">
+                LIVE CAMERA
+              </span>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* INTERVIEW SECURITY NOTICE */}
+
+      {!isActive && !securityMessage && (
+        <div className="px-6 py-3 bg-blue-50 border-b border-blue-100">
+          <p className="text-xs text-blue-800">
+            <strong>Interview Requirements:</strong>{" "}
+            Camera and microphone access are required.
+            Please remain on this interview page.
+            Leaving the browser tab or turning off the camera
+            may automatically cancel your interview.
+          </p>
+        </div>
+      )}
+
+      {/* QUESTION PREVIEW */}
+
+      {questions &&
+        questions.length > 0 &&
+        status === "idle" &&
+        !securityMessage && (
+          <div className="px-6 py-4 bg-gray-50 border-b border-gray-100">
+            <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-2">
+              This interview will cover {questions.length} question
+              {questions.length !== 1 ? "s" : ""}
+            </p>
+
+            <ol className="text-sm text-gray-600 space-y-1 list-decimal list-inside">
+              {questions.map((q, i) => (
+                <li key={i}>{q}</li>
+              ))}
+            </ol>
+          </div>
+        )}
+
+      {/* VOICE VISUALIZER */}
+
       {isActive && (
         <div className="px-6 py-3 bg-gradient-to-r from-primary-50 to-accent-50 border-b border-gray-100">
           <div className="flex items-center justify-center gap-1 h-8">
             {Array.from({ length: 20 }).map((_, i) => (
               <div
                 key={i}
-                className="w-1 rounded-full bg-primary-400"
+                className="w-1 rounded-full bg-primary-400 animate-pulse"
                 style={{
                   height: `${Math.random() * 24 + 4}px`,
                   animationDelay: `${i * 0.1}s`,
@@ -383,21 +806,25 @@ export function RecruiterVoiceAgent({
         </div>
       )}
 
-      {/* Anti-cheating / silence timer */}
-      {isActive && silenceSecondsLeft !== null && (
-        <div className="px-6 py-2 bg-amber-50 border-b border-amber-100 text-center">
-          <p className="text-xs font-medium text-amber-800">
-            No response detected. Next question in {silenceSecondsLeft}s
-          </p>
-        </div>
-      )}
+      {/* SILENCE TIMER */}
 
-      {/* Transcript area */}
-      <div className="px-6 py-4 max-h-48 overflow-y-auto space-y-2">
+      {isActive &&
+        silenceSecondsLeft !== null && (
+          <div className="px-6 py-2 bg-amber-50 border-b border-amber-100 text-center">
+            <p className="text-xs font-medium text-amber-800">
+              No response detected. Next question in{" "}
+              {silenceSecondsLeft}s
+            </p>
+          </div>
+        )}
+
+      {/* TRANSCRIPT */}
+
+      <div className="px-6 py-4 max-h-56 overflow-y-auto space-y-2">
         {transcript.length === 0 ? (
           <p className="text-sm text-gray-400 text-center py-4">
             {status === "idle"
-              ? 'Click "Start Screening Call" to begin the interview'
+              ? 'Click "Start Video Interview" to begin.'
               : "Waiting for the conversation to start..."}
           </p>
         ) : (
@@ -417,7 +844,8 @@ export function RecruiterVoiceAgent({
         )}
       </div>
 
-      {/* Controls */}
+      {/* CONTROLS */}
+
       <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-between">
         <div className="flex items-center gap-3">
           {isActive ? (
@@ -430,35 +858,61 @@ export function RecruiterVoiceAgent({
                 fill="currentColor"
                 viewBox="0 0 24 24"
               >
-                <rect x="6" y="6" width="12" height="12" rx="1" />
+                <rect
+                  x="6"
+                  y="6"
+                  width="12"
+                  height="12"
+                  rx="1"
+                />
               </svg>
-              End Call
+
+              End Interview
             </button>
           ) : (
             <button
               onClick={startCall}
-              disabled={!apiKey || !assistantIdToUse || !sdkReady}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-accent-600 text-white text-sm font-medium hover:bg-accent-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={
+                !apiKey ||
+                !assistantIdToUse ||
+                !sdkReady ||
+                cameraStarting ||
+                !!securityMessage
+              }
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-accent-600 text-white text-sm font-semibold hover:bg-accent-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <svg
-                className="w-4 h-4"
-                fill="none"
-                stroke="currentColor"
-                viewBox="0 0 24 24"
-              >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth={2}
-                  d="M3 5a2 2 0 012-2h3.28a1 1 0 01.948.684l1.498 4.493a1 1 0 01-.502 1.21l-2.257 1.13a11.042 11.042 0 005.516 5.516l1.13-2.257a1 1 0 011.21-.502l4.493 1.498a1 1 0 01.684.949V19a2 2 0 01-2 2h-1C9.716 21 3 14.284 3 6V5z"
-                />
-              </svg>
-              {sdkReady ? "Start Screening Call" : "Loading SDK..."}
+              {cameraStarting ? (
+                <>
+                  <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Starting Camera...
+                </>
+              ) : (
+                <>
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M4 6h11a2 2 0 012 2v8a2 2 0 01-2 2H4a2 2 0 01-2-2V8a2 2 0 012-2z"
+                    />
+                  </svg>
+
+                  {sdkReady
+                    ? "Start Video Interview"
+                    : "Loading Interview System..."}
+                </>
+              )}
             </button>
           )}
         </div>
 
-        {/* Volume control */}
+        {/* VOLUME */}
+
         <div className="flex items-center gap-2">
           <svg
             className="w-4 h-4 text-gray-400"
@@ -473,27 +927,31 @@ export function RecruiterVoiceAgent({
               d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z"
             />
           </svg>
+
           <input
             type="range"
             min="0"
             max="1"
             step="0.1"
             value={volume}
-            onChange={(e) => setVolume(parseFloat(e.target.value))}
+            onChange={(e) =>
+              setVolume(parseFloat(e.target.value))
+            }
             className="w-20 h-1 accent-primary-600"
           />
         </div>
       </div>
 
-      {/* Setup warning */}
+      {/* CONFIGURATION WARNING */}
+
       {(!apiKey || !assistantIdToUse) && (
         <div className="px-6 py-3 bg-yellow-50 border-t border-yellow-200">
           <p className="text-xs text-yellow-700">
             {!apiKey && !assistantIdToUse
-              ? "Set NEXT_PUBLIC_VAPI_API_KEY and NEXT_PUBLIC_VAPI_ASSISTANT_ID in your .env file to enable voice calls."
+              ? "Set NEXT_PUBLIC_VAPI_API_KEY and NEXT_PUBLIC_VAPI_ASSISTANT_ID in your .env file."
               : !apiKey
-              ? "Set NEXT_PUBLIC_VAPI_API_KEY in your .env file to enable voice calls."
-              : "Set NEXT_PUBLIC_VAPI_ASSISTANT_ID in your .env file to enable voice calls."}
+              ? "Set NEXT_PUBLIC_VAPI_API_KEY in your .env file."
+              : "Set NEXT_PUBLIC_VAPI_ASSISTANT_ID in your .env file."}
           </p>
         </div>
       )}
