@@ -22,6 +22,8 @@
     "@trpc/tanstack-react-query": "^11.16.0",
     "@vapi-ai/web": "^2.7.0",
     "bcryptjs": "^3.0.3",
+    "livekit-client": "^2.22.2",
+    "livekit-server-sdk": "^2.18.0",
     "next": "^16.2.4",
     "next-auth": "^4.24.14",
     "nodemailer": "^7.0.7",
