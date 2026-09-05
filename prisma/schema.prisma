@@ -117,8 +117,10 @@ model Call {
   id          String    @id @default(auto()) @map("_id") @db.ObjectId
   candidateId String    @db.ObjectId
   candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
-  status      String    @default("SCHEDULED") // SCHEDULED, IN_PROGRESS, COMPLETED, FAILED
-  type        String    @default("SCREENING") // SCREENING, INTERVIEW, FOLLOW_UP
+
+  status      String    @default("SCHEDULED")
+  type        String    @default("SCREENING")
+
   transcript  String?
   summary     String?
   duration    Int?
@@ -126,11 +128,11 @@ model Call {
   rating      Int?
   notes       String?
 
-  // AI-generated structured interview report (JSON string), produced after the
-  // call ends: { overallScore, recommendation, strengths[], concerns[],
-  // skillAssessment[], summary, communicationScore, technicalScore }
+  videoUrl    String?
+
   aiReport       String?
-  recommendation String? // STRONG_YES, YES, MAYBE, NO
+  recommendation String?
+
   scheduledAt DateTime?
   startedAt   DateTime?
   endedAt     DateTime?

@@ -141,6 +141,7 @@ export function PortalInterviewClient({ candidateId }: { candidateId: string }) 
       ) : (
         <RecruiterVoiceAgent
           candidateName={application.name}
+          candidateId={candidateId}
           jobTitle={application.job.title}
           questions={jobQuestions}
           onCallStart={handleCallStart}
