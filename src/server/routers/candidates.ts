@@ -5,7 +5,7 @@ import {
   adminProcedure,
   candidateProcedure,
 } from "@/src/server/trpc";
-import { analyzeResume } from "@/src/lib/gemini";
+import { analyzeResumeLocally } from "@/src/lib/resumeAI";
 import { sendInterviewInvitationEmail, sendRejectionEmail, sendHiredEmail } from "@/src/lib/mailer";
 
 export const candidatesRouter = createTRPCRouter({
@@ -279,13 +279,15 @@ export const candidatesRouter = createTRPCRouter({
         "🤖 Starting Gemini Resume Analysis..."
       );
 
-      const analysis = await analyzeResume({
-        jobTitle: job.title,
-        jobDescription: job.description,
-        jobRequirements: job.requirements,
-        jobSkills: job.skills,
-        resumeText: input.resumeText,
-      });
+      const analysis = await analyzeResumeLocally({
+  jobTitle: job.title,
+  jobDescription: job.description,
+  requirements: job.requirements ?? undefined,
+  skills: job.skills ?? undefined,
+  responsibilities: job.responsibilities ?? undefined,
+  experienceLevel: job.experienceLevel ?? undefined,
+  resumeText: input.resumeText,
+});
 
       console.log(
         "✅ Gemini Analysis Result:",
