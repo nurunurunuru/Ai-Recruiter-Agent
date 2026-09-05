@@ -203,27 +203,59 @@ export const candidatesRouter = createTRPCRouter({
   // ---------- CANDIDATE ----------
 
   // Candidate applies to a job. Resume text is analyzed by Gemini immediately.
-  submitApplication: candidateProcedure
-    .input(
-      z.object({
-        jobId: z.string(),
-        phone: z.string().optional(),
-        resumeText: z.string().min(30, "Please paste a more complete resume."),
-        resumeUrl: z.string().optional(),
-      })
-    )
-    .mutation(async ({ ctx, input }) => {
-      const job = await ctx.prisma.job.findUnique({ where: { id: input.jobId } });
-      if (!job) throw new TRPCError({ code: "NOT_FOUND", message: "Job not found" });
+ submitApplication: candidateProcedure
+  .input(
+    z.object({
+      jobId: z.string(),
+      phone: z.string().optional(),
+      resumeText: z.string().min(
+        30,
+        "Please paste a more complete resume."
+      ),
+      resumeUrl: z.string().optional(),
+    })
+  )
+  .mutation(async ({ ctx, input }) => {
+    console.log("=================================");
+    console.log("📥 New Job Application");
+    console.log("User:", ctx.user.email);
+    console.log("Job ID:", input.jobId);
+    console.log("Resume Length:", input.resumeText.length);
+    console.log("=================================");
 
-      const existing = await ctx.prisma.candidate.findUnique({
-        where: { jobId_userId: { jobId: input.jobId, userId: ctx.user.id } },
+    const job = await ctx.prisma.job.findUnique({
+      where: {
+        id: input.jobId,
+      },
+    });
+
+    if (!job) {
+      throw new TRPCError({
+        code: "NOT_FOUND",
+        message: "Job not found",
       });
-      if (existing) {
-        throw new TRPCError({ code: "CONFLICT", message: "You already applied to this job." });
-      }
+    }
 
-      const candidate = await ctx.prisma.candidate.create({
+    const existing =
+      await ctx.prisma.candidate.findUnique({
+        where: {
+          jobId_userId: {
+            jobId: input.jobId,
+            userId: ctx.user.id,
+          },
+        },
+      });
+
+    if (existing) {
+      throw new TRPCError({
+        code: "CONFLICT",
+        message: "You already applied to this job.",
+      });
+    }
+
+    // First save candidate
+    const candidate =
+      await ctx.prisma.candidate.create({
         data: {
           name: ctx.user.name,
           email: ctx.user.email,
@@ -236,30 +268,60 @@ export const candidatesRouter = createTRPCRouter({
         },
       });
 
-      // Run AI resume analysis. If Gemini isn't configured yet, don't fail the
-      // application — just leave it in APPLIED state for manual review.
-      try {
-        const analysis = await analyzeResume({
-          jobTitle: job.title,
-          jobDescription: job.description,
-          jobRequirements: job.requirements,
-          jobSkills: job.skills,
-          resumeText: input.resumeText,
-        });
+    console.log(
+      "✅ Candidate saved:",
+      candidate.id
+    );
 
-        return ctx.prisma.candidate.update({
-          where: { id: candidate.id },
+    // AI Resume Analysis
+    try {
+      console.log(
+        "🤖 Starting Gemini Resume Analysis..."
+      );
+
+      const analysis = await analyzeResume({
+        jobTitle: job.title,
+        jobDescription: job.description,
+        jobRequirements: job.requirements,
+        jobSkills: job.skills,
+        resumeText: input.resumeText,
+      });
+
+      console.log(
+        "✅ Gemini Analysis Result:",
+        JSON.stringify(analysis, null, 2)
+      );
+
+      const updatedCandidate =
+        await ctx.prisma.candidate.update({
+          where: {
+            id: candidate.id,
+          },
+
           data: {
             matchScore: analysis.matchScore,
             aiAnalysis: JSON.stringify(analysis),
             status: "AI_REVIEWED",
           },
         });
-      } catch (err) {
-        console.error("Resume AI analysis failed:", err);
-        return candidate;
-      }
-    }),
+
+      console.log(
+        `🎯 Candidate Match Score: ${analysis.matchScore}%`
+      );
+
+      return updatedCandidate;
+
+    } catch (err) {
+      console.error("=================================");
+      console.error("❌ RESUME AI ANALYSIS FAILED");
+      console.error("Candidate ID:", candidate.id);
+      console.error(err);
+      console.error("=================================");
+
+      // Candidate is still saved
+      return candidate;
+    }
+  }),
 
   getMyApplications: candidateProcedure.query(async ({ ctx }) => {
     return ctx.prisma.candidate.findMany({

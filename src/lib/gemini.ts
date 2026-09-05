@@ -1,90 +1,184 @@
-// Thin wrapper around the Google Gemini API (generativelanguage.googleapis.com).
-// Requires GEMINI_API_KEY in the environment. Get one free at https://aistudio.google.com/apikey
+// src/lib/gemini.ts
 
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
-const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+const GEMINI_API_URL =
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 interface GeminiCallOptions {
   systemInstruction?: string;
   temperature?: number;
-  jsonSchema?: object; // if provided, asks Gemini to respond with matching JSON
+  jsonSchema?: object;
 }
 
 /**
- * Calls Gemini with a prompt and returns the raw text response.
- * Throws if GEMINI_API_KEY isn't configured or the call fails.
+ * Call Gemini API
  */
 export async function callGemini(
   prompt: string,
   options: GeminiCallOptions = {}
 ): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY;
+
   if (!apiKey) {
-    throw new Error(
-      "GEMINI_API_KEY is not set. Add it to your .env file (see https://aistudio.google.com/apikey)."
-    );
+    throw new Error("GEMINI_API_KEY is not configured.");
   }
 
+  console.log("🤖 Calling Gemini model:", GEMINI_MODEL);
+
   const body: Record<string, unknown> = {
-    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: prompt,
+          },
+        ],
+      },
+    ],
+
     generationConfig: {
       temperature: options.temperature ?? 0.4,
+      maxOutputTokens: 4096,
+
       ...(options.jsonSchema
-        ? { responseMimeType: "application/json", responseSchema: options.jsonSchema }
+        ? {
+            responseMimeType: "application/json",
+            responseSchema: options.jsonSchema,
+          }
         : {}),
     },
   };
 
   if (options.systemInstruction) {
     body.systemInstruction = {
-      role: "system",
-      parts: [{ text: options.systemInstruction }],
+      parts: [
+        {
+          text: options.systemInstruction,
+        },
+      ],
     };
   }
 
   const res = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+
+    headers: {
+      "Content-Type": "application/json",
+    },
+
     body: JSON.stringify(body),
+
+    cache: "no-store",
   });
 
+  const responseText = await res.text();
+
+  console.log("📡 Gemini status:", res.status);
+
   if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Gemini API error (${res.status}): ${errText}`);
+    console.error("❌ Gemini API Error:", responseText);
+
+    throw new Error(
+      `Gemini API error (${res.status}): ${responseText}`
+    );
   }
 
-  const data = await res.json();
-  const text: string | undefined = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  let data: any;
+
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    console.error("❌ Invalid Gemini API response:", responseText);
+
+    throw new Error("Gemini returned an invalid response.");
+  }
+
+  const text =
+    data?.candidates?.[0]?.content?.parts
+      ?.map((part: any) => part.text || "")
+      .join("")
+      .trim();
+
   if (!text) {
+    console.error(
+      "❌ Gemini empty response:",
+      JSON.stringify(data, null, 2)
+    );
+
     throw new Error("Gemini API returned an empty response.");
   }
+
+  console.log("✅ Gemini response received");
+
   return text;
 }
 
-/** Calls Gemini and parses the response as JSON, stripping any ```json fences. */
+/**
+ * Extract JSON safely from Gemini response
+ */
+function extractJSON(raw: string): string {
+  let cleaned = raw.trim();
+
+  // Remove markdown code fences
+  cleaned = cleaned
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
+
+  // Find JSON object
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+
+  if (firstBrace !== -1 && lastBrace !== -1) {
+    cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+  }
+
+  return cleaned;
+}
+
+/**
+ * Call Gemini and parse JSON response safely
+ */
 export async function callGeminiJSON<T = unknown>(
   prompt: string,
   options: GeminiCallOptions = {}
 ): Promise<T> {
   const raw = await callGemini(prompt, options);
-  const cleaned = raw.replace(/```json|```/g, "").trim();
+
+  console.log("📄 Raw Gemini response:", raw);
+
+  const cleaned = extractJSON(raw);
+
   try {
     return JSON.parse(cleaned) as T;
-  } catch {
-    throw new Error(`Failed to parse Gemini JSON response: ${cleaned.slice(0, 300)}`);
+  } catch (error) {
+    console.error("❌ JSON Parse Failed");
+    console.error("Raw:", raw);
+    console.error("Cleaned:", cleaned);
+
+    throw new Error(
+      `Failed to parse Gemini JSON response: ${cleaned.slice(0, 500)}`
+    );
   }
 }
 
-// ---------------------------------------------------------------------------
-// Domain-specific helpers
-// ---------------------------------------------------------------------------
+// ======================================================
+// Resume Analysis
+// ======================================================
 
 export interface ResumeAnalysis {
-  matchScore: number; // 0-100
+  matchScore: number;
   summary: string;
   strengths: string[];
   gaps: string[];
-  recommendation: "STRONG_MATCH" | "GOOD_MATCH" | "PARTIAL_MATCH" | "WEAK_MATCH";
+  recommendation:
+    | "STRONG_MATCH"
+    | "GOOD_MATCH"
+    | "PARTIAL_MATCH"
+    | "WEAK_MATCH";
 }
 
 export async function analyzeResume(params: {
@@ -94,33 +188,110 @@ export async function analyzeResume(params: {
   jobSkills?: string | null;
   resumeText: string;
 }): Promise<ResumeAnalysis> {
-  const prompt = `You are an expert technical recruiter. Compare the candidate's resume against the job below and score how well they match.
+  console.log("📄 Starting Resume Analysis...");
+  console.log("Job:", params.jobTitle);
+  console.log("Resume length:", params.resumeText.length);
 
-JOB TITLE: ${params.jobTitle}
-JOB DESCRIPTION: ${params.jobDescription}
-REQUIREMENTS: ${params.jobRequirements || "N/A"}
-KEY SKILLS: ${params.jobSkills || "N/A"}
+  const prompt = `
+You are an expert AI recruiter and resume screening system.
+
+Your task is to analyze the candidate's resume against the job requirements.
+
+JOB TITLE:
+${params.jobTitle}
+
+JOB DESCRIPTION:
+${params.jobDescription || "Not provided"}
+
+JOB REQUIREMENTS:
+${params.jobRequirements || "Not provided"}
+
+REQUIRED SKILLS:
+${params.jobSkills || "Not provided"}
 
 CANDIDATE RESUME:
 ${params.resumeText}
 
-Respond ONLY with a JSON object, no markdown, matching exactly this shape:
-{
-  "matchScore": <integer 0-100, how well the candidate matches the job>,
-  "summary": "<2-3 sentence overall summary>",
-  "strengths": ["<point>", "..."],
-  "gaps": ["<point>", "..."],
-  "recommendation": "STRONG_MATCH" | "GOOD_MATCH" | "PARTIAL_MATCH" | "WEAK_MATCH"
-}`;
+Evaluate the candidate carefully.
 
-  return callGeminiJSON<ResumeAnalysis>(prompt, { temperature: 0.3 });
+Calculate a realistic match score between 0 and 100.
+
+Return ONLY valid JSON.
+
+The JSON MUST follow exactly this structure:
+
+{
+  "matchScore": 75,
+  "summary": "Brief professional summary of the candidate's suitability.",
+  "strengths": [
+    "Relevant technical experience",
+    "Strong communication skills"
+  ],
+  "gaps": [
+    "Limited experience with cloud infrastructure"
+  ],
+  "recommendation": "GOOD_MATCH"
 }
+
+IMPORTANT RULES:
+
+- matchScore must be an integer from 0 to 100.
+- strengths must always be an array.
+- gaps must always be an array.
+- recommendation must be exactly one of:
+  STRONG_MATCH
+  GOOD_MATCH
+  PARTIAL_MATCH
+  WEAK_MATCH
+- Do not use markdown.
+- Do not use code fences.
+- Do not include explanations outside JSON.
+`.trim();
+
+  const analysis = await callGeminiJSON<ResumeAnalysis>(
+    prompt,
+    {
+      temperature: 0.2,
+    }
+  );
+
+  // Validate result
+  if (
+    typeof analysis.matchScore !== "number" ||
+    Number.isNaN(analysis.matchScore)
+  ) {
+    throw new Error("Gemini returned invalid matchScore.");
+  }
+
+  analysis.matchScore = Math.max(
+    0,
+    Math.min(100, Math.round(analysis.matchScore))
+  );
+
+  if (!Array.isArray(analysis.strengths)) {
+    analysis.strengths = [];
+  }
+
+  if (!Array.isArray(analysis.gaps)) {
+    analysis.gaps = [];
+  }
+
+  console.log(
+    `✅ Resume analysis completed. Match score: ${analysis.matchScore}%`
+  );
+
+  return analysis;
+}
+
+// ======================================================
+// Job Post Generation
+// ======================================================
 
 export interface GeneratedJobPost {
   description: string;
   requirements: string;
   responsibilities: string;
-  skills: string; // comma separated
+  skills: string;
   employmentType: string;
   experienceLevel: string;
   salaryRange: string;
@@ -131,35 +302,46 @@ export async function generateJobPost(params: {
   department?: string;
   location?: string;
 }): Promise<GeneratedJobPost> {
-  const prompt = `Write a complete, professional job posting for the role below.
+  const prompt = `Write a complete, professional job posting.
 
 JOB TITLE: ${params.title}
 DEPARTMENT: ${params.department || "N/A"}
 LOCATION: ${params.location || "N/A"}
 
-Respond ONLY with a JSON object, no markdown, matching exactly this shape:
+Return ONLY valid JSON:
+
 {
-  "description": "<3-5 paragraph engaging job description>",
-  "requirements": "<bullet list as plain text, one requirement per line, prefixed with '- '>",
-  "responsibilities": "<bullet list as plain text, one responsibility per line, prefixed with '- '>",
-  "skills": "<comma separated list of 6-10 key skills>",
-  "employmentType": "FULL_TIME" | "PART_TIME" | "CONTRACT" | "INTERNSHIP",
-  "experienceLevel": "ENTRY" | "MID" | "SENIOR" | "LEAD",
-  "salaryRange": "<a reasonable market salary range as plain text, e.g. '$70,000 - $95,000/year'>"
+  "description": "",
+  "requirements": "",
+  "responsibilities": "",
+  "skills": "",
+  "employmentType": "",
+  "experienceLevel": "",
+  "salaryRange": ""
 }`;
 
-  return callGeminiJSON<GeneratedJobPost>(prompt, { temperature: 0.6 });
+  return callGeminiJSON<GeneratedJobPost>(prompt, {
+    temperature: 0.6,
+  });
 }
 
+// ======================================================
+// Interview Report
+// ======================================================
+
 export interface InterviewReport {
-  overallScore: number; // 0-100
+  overallScore: number;
   recommendation: "STRONG_YES" | "YES" | "MAYBE" | "NO";
   summary: string;
   strengths: string[];
   concerns: string[];
-  skillAssessment: { skill: string; rating: number; note: string }[];
-  communicationScore: number; // 0-100
-  technicalScore: number; // 0-100
+  skillAssessment: {
+    skill: string;
+    rating: number;
+    note: string;
+  }[];
+  communicationScore: number;
+  technicalScore: number;
 }
 
 export async function generateInterviewReport(params: {
@@ -168,33 +350,42 @@ export async function generateInterviewReport(params: {
   candidateName: string;
   transcript: string;
 }): Promise<InterviewReport> {
-  const prompt = `You are a senior hiring manager reviewing an AI-conducted voice screening interview transcript. Produce a structured, objective evaluation.
+  const prompt = `You are a senior hiring manager reviewing an AI interview.
 
 JOB TITLE: ${params.jobTitle}
 JOB DESCRIPTION: ${params.jobDescription}
 CANDIDATE: ${params.candidateName}
 
-TRANSCRIPT:
+INTERVIEW TRANSCRIPT:
 ${params.transcript}
 
-Respond ONLY with a JSON object, no markdown, matching exactly this shape:
+Return ONLY valid JSON:
+
 {
-  "overallScore": <integer 0-100>,
-  "recommendation": "STRONG_YES" | "YES" | "MAYBE" | "NO",
-  "summary": "<3-4 sentence overall summary of interview performance>",
-  "strengths": ["<point>", "..."],
-  "concerns": ["<point>", "..."],
-  "skillAssessment": [{ "skill": "<skill name>", "rating": <1-5>, "note": "<short note>" }],
-  "communicationScore": <integer 0-100>,
-  "technicalScore": <integer 0-100>
+  "overallScore": 0,
+  "recommendation": "YES",
+  "summary": "",
+  "strengths": [],
+  "concerns": [],
+  "skillAssessment": [
+    {
+      "skill": "",
+      "rating": 1,
+      "note": ""
+    }
+  ],
+  "communicationScore": 0,
+  "technicalScore": 0
 }`;
 
-  return callGeminiJSON<InterviewReport>(prompt, { temperature: 0.3 });
+  return callGeminiJSON<InterviewReport>(prompt, {
+    temperature: 0.3,
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Interview question generation (per-job voice interview question set)
-// ---------------------------------------------------------------------------
+// ======================================================
+// Interview Question Generation
+// ======================================================
 
 export async function generateInterviewQuestions(params: {
   jobTitle: string;
@@ -204,23 +395,36 @@ export async function generateInterviewQuestions(params: {
   count?: number;
 }): Promise<string[]> {
   const count = params.count ?? 6;
-  const prompt = `You are designing a short AI voice screening interview for the role below.
-Write ${count} clear, conversational interview questions a voice AI should ask a candidate.
-Mix in: 1-2 background/experience questions, 2-3 role-specific/technical questions based on the
-requirements and skills, and 1 behavioral/situational question. Keep each question a single
-sentence, natural to say out loud, and self-contained (no "as mentioned above").
+
+  const prompt = `Generate ${count} professional AI voice interview questions.
 
 JOB TITLE: ${params.jobTitle}
-JOB DESCRIPTION: ${params.jobDescription}
-REQUIREMENTS: ${params.jobRequirements || "N/A"}
-KEY SKILLS: ${params.jobSkills || "N/A"}
 
-Respond ONLY with a JSON object, no markdown, matching exactly this shape:
+JOB DESCRIPTION:
+${params.jobDescription}
+
+REQUIREMENTS:
+${params.jobRequirements || "N/A"}
+
+SKILLS:
+${params.jobSkills || "N/A"}
+
+Return ONLY valid JSON:
+
 {
-  "questions": ["<question 1>", "<question 2>", ...]
+  "questions": [
+    "Question 1",
+    "Question 2"
+  ]
 }`;
 
-  const result = await callGeminiJSON<{ questions: string[] }>(prompt, { temperature: 0.6 });
-  return result.questions;
-}
+  const result = await callGeminiJSON<{
+    questions: string[];
+  }>(prompt, {
+    temperature: 0.6,
+  });
 
+  return Array.isArray(result.questions)
+    ? result.questions
+    : [];
+}

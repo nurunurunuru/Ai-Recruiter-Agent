@@ -107,7 +107,6 @@ export function DashboardClient() {
           AI Voice Agent
         </h2>
         <RecruiterVoiceAgent
-          candidateId="demo-candidate"
           candidateName="Demo Candidate"
           jobTitle="Software Engineer"
         />
