@@ -40,6 +40,12 @@ const GEMINI_MODEL = "gemini-3.1-flash-live-preview";
 const INPUT_SAMPLE_RATE = 16000;
 const OUTPUT_SAMPLE_RATE = 24000;
 
+/*
+ * =========================================================
+ * HELPERS
+ * =========================================================
+ */
+
 const arrayBufferToBase64 = (
   buffer: ArrayBufferLike
 ): string => {
@@ -135,6 +141,12 @@ const resampleTo16k = (
   return output;
 };
 
+/*
+ * =========================================================
+ * COMPONENT
+ * =========================================================
+ */
+
 export function RecruiterVoiceAgent({
   assistantId,
   candidateName,
@@ -212,10 +224,11 @@ export function RecruiterVoiceAgent({
   const wsRef =
     useRef<WebSocket | null>(null);
 
-  const inputAudioContextRef =
-    useRef<AudioContext | null>(null);
+  /*
+   * Candidate microphone → Gemini
+   */
 
-  const outputAudioContextRef =
+  const inputAudioContextRef =
     useRef<AudioContext | null>(null);
 
   const inputSourceRef =
@@ -227,6 +240,41 @@ export function RecruiterVoiceAgent({
   const inputGainRef =
     useRef<GainNode | null>(null);
 
+  /*
+   * IMPORTANT:
+   *
+   * There is ONLY ONE output AudioContext.
+   *
+   * Gemini AI audio playback and recording mixer
+   * both use this SAME context.
+   */
+
+  const outputAudioContextRef =
+    useRef<AudioContext | null>(null);
+
+  /*
+   * Recording mixer
+   *
+   * Candidate mic + Gemini AI voice
+   *          ↓
+   * MediaStreamDestination
+   *          ↓
+   * MediaRecorder
+   */
+
+  const recordingDestinationRef =
+    useRef<MediaStreamAudioDestinationNode | null>(null);
+
+  const recordingMicSourceRef =
+    useRef<MediaStreamAudioSourceNode | null>(null);
+
+  const recordingMicGainRef =
+    useRef<GainNode | null>(null);
+
+  /*
+   * Gemini playback sources
+   */
+
   const activeAudioSourcesRef =
     useRef<Set<AudioBufferSourceNode>>(
       new Set()
@@ -235,23 +283,12 @@ export function RecruiterVoiceAgent({
   const nextPlaybackTimeRef =
     useRef(0);
 
+  /*
+   * Transcript refs
+   */
+
   const transcriptRef =
     useRef<TranscriptItem[]>([]);
-
-  const isInterviewActiveRef =
-    useRef(false);
-
-  const hasStartedRef =
-    useRef(false);
-
-  const isEndingRef =
-    useRef(false);
-
-  const cameraTrackRef =
-    useRef<MediaStreamTrack | null>(null);
-
-  const securityViolationRef =
-    useRef(false);
 
   const outputTranscriptBufferRef =
     useRef("");
@@ -263,9 +300,32 @@ export function RecruiterVoiceAgent({
     useRef("");
 
   /*
-   * assistantId is intentionally not used.
-   * Kept for DashboardClient compatibility.
+   * Interview refs
    */
+
+  const isInterviewActiveRef =
+    useRef(false);
+
+  const hasStartedRef =
+    useRef(false);
+
+  const isEndingRef =
+    useRef(false);
+
+  /*
+   * Camera/security refs
+   */
+
+  const cameraTrackRef =
+    useRef<MediaStreamTrack | null>(null);
+
+  const securityViolationRef =
+    useRef(false);
+
+  /*
+   * assistantId intentionally unused.
+   */
+
   void assistantId;
 
   /*
@@ -304,6 +364,39 @@ export function RecruiterVoiceAgent({
     },
     []
   );
+
+  /*
+   * =========================================================
+   * GET / CREATE OUTPUT AUDIO CONTEXT
+   *
+   * VERY IMPORTANT:
+   *
+   * This function guarantees that the whole application
+   * uses ONE AudioContext for Gemini output + recording.
+   * =========================================================
+   */
+
+  const getOutputAudioContext =
+    useCallback(async () => {
+      let context =
+        outputAudioContextRef.current;
+
+      if (!context) {
+        context = new AudioContext({
+          sampleRate:
+            OUTPUT_SAMPLE_RATE,
+        });
+
+        outputAudioContextRef.current =
+          context;
+      }
+
+      if (context.state === "suspended") {
+        await context.resume();
+      }
+
+      return context;
+    }, []);
 
   /*
    * =========================================================
@@ -347,6 +440,13 @@ export function RecruiterVoiceAgent({
   /*
    * =========================================================
    * GEMINI AUDIO PLAYBACK
+   *
+   * Gemini AI voice goes to:
+   *
+   * 1. Speaker
+   * 2. Recording mixer
+   *
+   * BOTH are connected from the SAME AudioContext.
    * =========================================================
    */
 
@@ -358,23 +458,8 @@ export function RecruiterVoiceAgent({
             return;
           }
 
-          let context =
-            outputAudioContextRef.current;
-
-          if (!context) {
-            context =
-              new AudioContext({
-                sampleRate:
-                  OUTPUT_SAMPLE_RATE,
-              });
-
-            outputAudioContextRef.current =
-              context;
-          }
-
-          if (context.state === "suspended") {
-            await context.resume();
-          }
+          const context =
+            await getOutputAudioContext();
 
           const arrayBuffer =
             base64ToArrayBuffer(
@@ -412,9 +497,40 @@ export function RecruiterVoiceAgent({
 
           source.buffer = audioBuffer;
 
+          /*
+           * ================================================
+           * AI VOICE → SPEAKER
+           * ================================================
+           */
+
           source.connect(
             context.destination
           );
+
+          /*
+           * ================================================
+           * AI VOICE → RECORDING MIXER
+           *
+           * IMPORTANT:
+           * recordingDestination was created from THIS
+           * SAME context.
+           * ================================================
+           */
+
+          const recordingDestination =
+            recordingDestinationRef.current;
+
+          if (recordingDestination) {
+            source.connect(
+              recordingDestination
+            );
+          }
+
+          /*
+           * ================================================
+           * PLAYBACK SCHEDULING
+           * ================================================
+           */
 
           const now =
             context.currentTime;
@@ -462,7 +578,7 @@ export function RecruiterVoiceAgent({
           );
         }
       },
-      []
+      [getOutputAudioContext]
     );
 
   /*
@@ -599,15 +715,21 @@ Start the interview immediately when instructed.
         const stream =
           await navigator.mediaDevices.getUserMedia(
             {
-              video: {
-                width: {
-                  ideal: 1280,
-                },
-                height: {
-                  ideal: 720,
-                },
-                facingMode: "user",
-              },
+             video: {
+  width: {
+    ideal: 854,
+    max: 854,
+  },
+  height: {
+    ideal: 480,
+    max: 480,
+  },
+  facingMode: "user",
+  frameRate: {
+    ideal: 24,
+    max: 24,
+  },
+},
               audio: {
                 echoCancellation: true,
                 noiseSuppression: true,
@@ -681,65 +803,232 @@ Start the interview immediately when instructed.
 
   /*
    * =========================================================
-   * VIDEO RECORDING
+   * START RECORDING
+   *
+   * RECORDING:
+   *
+   * Camera
+   *   +
+   * Candidate microphone
+   *   +
+   * Gemini AI voice
+   *   ↓
+   * WebM
    * =========================================================
    */
 
-  const startRecording =
-    useCallback(() => {
-      const stream =
-        mediaStreamRef.current;
+ const startRecording =
+  useCallback(async () => {
+    const stream =
+      mediaStreamRef.current;
 
-      if (!stream) {
-        throw new Error(
-          "Camera stream is not available."
+    if (!stream) {
+      throw new Error(
+        "Camera stream is not available."
+      );
+    }
+
+    if (
+      typeof MediaRecorder ===
+      "undefined"
+    ) {
+      throw new Error(
+        "Video recording is not supported by this browser."
+      );
+    }
+
+    recordedChunksRef.current = [];
+
+    /*
+     * =====================================================
+     * SAME OUTPUT AUDIO CONTEXT
+     *
+     * Gemini AI voice + candidate microphone
+     * will use the SAME AudioContext.
+     * =====================================================
+     */
+
+    const audioContext =
+      await getOutputAudioContext();
+
+    /*
+     * =====================================================
+     * RECORDING DESTINATION
+     * =====================================================
+     */
+
+    let recordingDestination =
+      recordingDestinationRef.current;
+
+    if (!recordingDestination) {
+      recordingDestination =
+        audioContext.createMediaStreamDestination();
+
+      recordingDestinationRef.current =
+        recordingDestination;
+    }
+
+    /*
+     * =====================================================
+     * CANDIDATE MICROPHONE
+     *
+     * Candidate microphone
+     *        ↓
+     * Gain
+     *        ↓
+     * Recording Destination
+     * =====================================================
+     */
+
+    if (
+      !recordingMicSourceRef.current
+    ) {
+      const micSource =
+        audioContext.createMediaStreamSource(
+          stream
         );
-      }
 
-      if (
-        typeof MediaRecorder ===
-        "undefined"
-      ) {
-        throw new Error(
-          "Video recording is not supported by this browser."
-        );
-      }
+      recordingMicSourceRef.current =
+        micSource;
 
-      recordedChunksRef.current =
-        [];
+      const micGain =
+        audioContext.createGain();
 
-      let mimeType =
-        "video/webm;codecs=vp9,opus";
+      /*
+       * Candidate voice volume.
+       */
 
-      if (
-        !MediaRecorder.isTypeSupported(
-          mimeType
-        )
-      ) {
-        mimeType =
-          "video/webm;codecs=vp8,opus";
-      }
+      micGain.gain.value = 1;
 
-      if (
-        !MediaRecorder.isTypeSupported(
-          mimeType
-        )
-      ) {
-        mimeType = "video/webm";
-      }
+      recordingMicGainRef.current =
+        micGain;
 
-      const recorder =
-        new MediaRecorder(stream, {
+      micSource.connect(
+        micGain
+      );
+
+      micGain.connect(
+        recordingDestination
+      );
+    }
+
+    /*
+     * =====================================================
+     * CAMERA TRACK
+     * =====================================================
+     */
+
+    const videoTrack =
+      stream.getVideoTracks()[0];
+
+    if (!videoTrack) {
+      throw new Error(
+        "Camera video track is not available."
+      );
+    }
+
+    /*
+     * =====================================================
+     * MIXED AUDIO TRACK
+     *
+     * Contains:
+     *
+     * Candidate microphone
+     * +
+     * Gemini AI voice
+     * =====================================================
+     */
+
+    const mixedAudioTrack =
+      recordingDestination.stream
+        .getAudioTracks()[0];
+
+    if (!mixedAudioTrack) {
+      throw new Error(
+        "Recording audio track could not be created."
+      );
+    }
+
+    /*
+     * =====================================================
+     * FINAL RECORDING STREAM
+     * =====================================================
+     */
+
+    const recordingStream =
+      new MediaStream([
+        videoTrack,
+        mixedAudioTrack,
+      ]);
+
+    /*
+     * =====================================================
+     * MIME TYPE
+     * =====================================================
+     */
+
+    let mimeType =
+      "video/webm;codecs=vp8,opus";
+
+    if (
+      !MediaRecorder.isTypeSupported(
+        mimeType
+      )
+    ) {
+      mimeType =
+        "video/webm";
+    }
+
+    /*
+     * =====================================================
+     * IMPORTANT:
+     *
+     * LOW BITRATE
+     *
+     * 480p video
+     * + candidate voice
+     * + AI recruiter voice
+     *
+     * This keeps interview recordings much smaller.
+     * =====================================================
+     */
+
+    const recorder =
+      new MediaRecorder(
+        recordingStream,
+        {
           mimeType,
-          videoBitsPerSecond:
-            2_500_000,
-          audioBitsPerSecond:
-            128_000,
-        });
 
-      recorder.ondataavailable = (
-        event
-      ) => {
+          /*
+           * 450 kbps video
+           *
+           * This is intentionally low because
+           * Supabase has a 50 MB object limit.
+           */
+
+          videoBitsPerSecond:
+            450_000,
+
+          /*
+           * 48 kbps audio
+           *
+           * Voice interview does not need
+           * high-quality music-level audio.
+           */
+
+          audioBitsPerSecond:
+            48_000,
+        }
+      );
+
+    /*
+     * =====================================================
+     * DATA AVAILABLE
+     * =====================================================
+     */
+
+    recorder.ondataavailable =
+      (event) => {
         if (
           event.data &&
           event.data.size > 0
@@ -747,10 +1036,38 @@ Start the interview immediately when instructed.
           recordedChunksRef.current.push(
             event.data
           );
+
+          /*
+           * Log current recording size.
+           */
+
+          const currentSize =
+            recordedChunksRef.current.reduce(
+              (total, chunk) =>
+                total + chunk.size,
+              0
+            );
+
+          const currentMB =
+            currentSize /
+            (1024 * 1024);
+
+          console.log(
+            `🎥 Current recording size: ${currentMB.toFixed(
+              2
+            )} MB`
+          );
         }
       };
 
-      recorder.onerror = (event) => {
+    /*
+     * =====================================================
+     * RECORDER ERROR
+     * =====================================================
+     */
+
+    recorder.onerror =
+      (event) => {
         console.error(
           "MediaRecorder error:",
           event
@@ -761,27 +1078,93 @@ Start the interview immediately when instructed.
         );
       };
 
-      recorder.onstart = () => {
-        console.log(
-          "🎥 Video recording started."
+    /*
+     * =====================================================
+     * RECORDER START
+     * =====================================================
+     */
+
+    recorder.onstart = () => {
+      console.log(
+        "🎥 Recording started:"
+      );
+
+      console.log(
+        "📹 Camera: 480p"
+      );
+
+      console.log(
+        "🎤 Candidate voice: ON"
+      );
+
+      console.log(
+        "🤖 AI recruiter voice: ON"
+      );
+
+      console.log(
+        "📦 Video bitrate: 450 kbps"
+      );
+
+      console.log(
+        "🎧 Audio bitrate: 48 kbps"
+      );
+
+      setIsRecording(true);
+    };
+
+    /*
+     * =====================================================
+     * RECORDER STOP
+     * =====================================================
+     */
+
+    recorder.onstop = () => {
+      console.log(
+        "🎥 Recording stopped."
+      );
+
+      const finalSize =
+        recordedChunksRef.current.reduce(
+          (total, chunk) =>
+            total + chunk.size,
+          0
         );
 
-        setIsRecording(true);
-      };
+      console.log(
+        `📦 Final recording size: ${(
+          finalSize /
+          (1024 * 1024)
+        ).toFixed(2)} MB`
+      );
 
-      recorder.onstop = () => {
-        console.log(
-          "🎥 Video recording stopped."
-        );
+      setIsRecording(false);
+    };
 
-        setIsRecording(false);
-      };
+    /*
+     * =====================================================
+     * SAVE RECORDER
+     * =====================================================
+     */
 
-      mediaRecorderRef.current =
-        recorder;
+    mediaRecorderRef.current =
+      recorder;
 
-      recorder.start(1000);
-    }, []);
+    /*
+     * =====================================================
+     * START RECORDING
+     *
+     * Generate chunks every 1 second.
+     * =====================================================
+     */
+
+    recorder.start(1000);
+
+    console.log(
+      "🎥 Video recording initialized successfully."
+    );
+  }, [
+    getOutputAudioContext,
+  ]);
 
   /*
    * =========================================================
@@ -831,12 +1214,18 @@ Start the interview immediately when instructed.
           }
         );
 
+        /*
+         * Give MediaRecorder a short time
+         * to flush the final chunk.
+         */
+
         await new Promise<void>(
-          (resolve) =>
+          (resolve) => {
             window.setTimeout(
               resolve,
-              100
-            )
+              150
+            );
+          }
         );
 
         const chunks =
@@ -846,8 +1235,6 @@ Start the interview immediately when instructed.
           console.warn(
             "No video chunks recorded."
           );
-
-          setIsUploading(false);
 
           return null;
         }
@@ -922,12 +1309,27 @@ Start the interview immediately when instructed.
   /*
    * =========================================================
    * AUDIO CLEANUP
+   *
+   * IMPORTANT:
+   *
+   * There is NO separate recording AudioContext.
+   *
+   * Recording destination belongs to the same
+   * outputAudioContext.
+   *
+   * Therefore we close output context only ONCE.
    * =========================================================
    */
 
   const cleanupAudio =
     useCallback(() => {
       stopAllAudioPlayback();
+
+      /*
+       * ================================================
+       * GEMINI MICROPHONE AUDIO CLEANUP
+       * ================================================
+       */
 
       const processor =
         scriptProcessorRef.current;
@@ -936,6 +1338,7 @@ Start the interview immediately when instructed.
         try {
           processor.onaudioprocess =
             null;
+
           processor.disconnect();
         } catch {
           // ignore
@@ -964,27 +1367,74 @@ Start the interview immediately when instructed.
         }
       }
 
-      inputGainRef.current = null;
+      inputGainRef.current =
+        null;
 
       const inputContext =
         inputAudioContextRef.current;
 
       if (inputContext) {
-        void inputContext.close().catch(
-          () => {}
-        );
+        void inputContext
+          .close()
+          .catch(() => {});
       }
 
       inputAudioContextRef.current =
         null;
 
+      /*
+       * ================================================
+       * RECORDING MIXER CLEANUP
+       * ================================================
+       */
+
+      if (
+        recordingMicSourceRef.current
+      ) {
+        try {
+          recordingMicSourceRef.current.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+
+      recordingMicSourceRef.current =
+        null;
+
+      if (
+        recordingMicGainRef.current
+      ) {
+        try {
+          recordingMicGainRef.current.disconnect();
+        } catch {
+          // ignore
+        }
+      }
+
+      recordingMicGainRef.current =
+        null;
+
+      /*
+       * Destination belongs to output context.
+       * Just remove the reference.
+       */
+
+      recordingDestinationRef.current =
+        null;
+
+      /*
+       * ================================================
+       * GEMINI OUTPUT AUDIO CLEANUP
+       * ================================================
+       */
+
       const outputContext =
         outputAudioContextRef.current;
 
       if (outputContext) {
-        void outputContext.close().catch(
-          () => {}
-        );
+        void outputContext
+          .close()
+          .catch(() => {});
       }
 
       outputAudioContextRef.current =
@@ -1094,10 +1544,6 @@ Start the interview immediately when instructed.
   /*
    * =========================================================
    * START GEMINI MICROPHONE
-   *
-   * IMPORTANT:
-   * This function is called ONLY after
-   * Gemini sends setupComplete.
    * =========================================================
    */
 
@@ -1160,11 +1606,6 @@ Start the interview immediately when instructed.
       inputGainRef.current =
         gain;
 
-      /*
-       * ScriptProcessor is deprecated by browsers,
-       * but it remains widely supported and keeps
-       * this implementation simple and compatible.
-       */
       const processor =
         audioContext.createScriptProcessor(
           4096,
@@ -1220,12 +1661,6 @@ Start the interview immediately when instructed.
               return;
             }
 
-            /*
-             * IMPORTANT:
-             * Gemini Live expects realtimeInput.audio.
-             *
-             * DO NOT change this to mediaChunks.
-             */
             currentWs.send(
               JSON.stringify({
                 realtimeInput: {
@@ -1245,25 +1680,17 @@ Start the interview immediately when instructed.
           }
         };
 
-      /*
-       * Connect:
-       *
-       * microphone
-       *      ↓
-       * source
-       *      ↓
-       * gain
-       *      ↓
-       * processor
-       *
-       * We do not connect the processor
-       * to destination because otherwise
-       * the microphone can echo back.
-       */
-
       source.connect(gain);
 
       gain.connect(processor);
+
+      /*
+       * ScriptProcessor needs to be connected
+       * somewhere to continue processing.
+       *
+       * The processor itself does not receive
+       * direct microphone speaker playback.
+       */
 
       processor.connect(
         audioContext.destination
@@ -1276,7 +1703,7 @@ Start the interview immediately when instructed.
 
   /*
    * =========================================================
-   * GET GEMINI EPHEMERAL TOKEN
+   * GET GEMINI TOKEN
    * =========================================================
    */
 
@@ -1365,9 +1792,7 @@ Start the interview immediately when instructed.
               setSecurityWarning(
                 securityReason
               );
-            }
 
-            if (securityReason) {
               onSecurityViolation?.(
                 securityReason
               );
@@ -1380,7 +1805,9 @@ Start the interview immediately when instructed.
           setIsInterviewActive(false);
 
           /*
-           * Close Gemini WebSocket.
+           * ================================================
+           * CLOSE GEMINI WEBSOCKET
+           * ================================================
            */
 
           const ws =
@@ -1397,20 +1824,39 @@ Start the interview immediately when instructed.
           }
 
           /*
-           * Stop recording and upload video.
+           * ================================================
+           * STOP RECORDING + UPLOAD
+           * ================================================
            */
 
-        const videoUrl = await stopRecording();
+          const videoUrl =
+            await stopRecording();
 
-const finalTranscript =
-  generateFinalTranscript();
+          /*
+           * ================================================
+           * FINAL TRANSCRIPT
+           * ================================================
+           */
 
+          const finalTranscript =
+            generateFinalTranscript();
 
-  onCallComplete?.(
-    finalTranscript,
-    videoUrl || undefined
-  );
+          /*
+           * ================================================
+           * SEND RESULT TO PARENT
+           * ================================================
+           */
 
+          onCallComplete?.(
+            finalTranscript,
+            videoUrl || undefined
+          );
+
+          /*
+           * ================================================
+           * CLEANUP
+           * ================================================
+           */
 
           cleanupAudio();
 
@@ -1436,7 +1882,9 @@ const finalTranscript =
             endError
           );
 
-          setConnectionStatus("error");
+          setConnectionStatus(
+            "error"
+          );
         } finally {
           onCallEnd?.();
 
@@ -1497,12 +1945,9 @@ const finalTranscript =
           }
 
           /*
-           * =================================================
+           * ================================================
            * SETUP COMPLETE
-           *
-           * IMPORTANT:
-           * Microphone starts HERE, not on WebSocket open.
-           * =================================================
+           * ================================================
            */
 
           if (message.setupComplete) {
@@ -1542,8 +1987,7 @@ const finalTranscript =
             }
 
             /*
-             * Give Gemini a short moment,
-             * then explicitly start interview.
+             * Start interview after a short delay.
              */
 
             window.setTimeout(() => {
@@ -1574,9 +2018,9 @@ Do not wait for another message.
           }
 
           /*
-           * =================================================
+           * ================================================
            * GEMINI ERROR
-           * =================================================
+           * ================================================
            */
 
           if (message.error) {
@@ -1601,9 +2045,9 @@ Do not wait for another message.
           }
 
           /*
-           * =================================================
+           * ================================================
            * SERVER CONTENT
-           * =================================================
+           * ================================================
            */
 
           const serverContent =
@@ -1614,9 +2058,9 @@ Do not wait for another message.
           }
 
           /*
-           * =================================================
+           * ================================================
            * INTERRUPTION
-           * =================================================
+           * ================================================
            */
 
           if (
@@ -1638,9 +2082,9 @@ Do not wait for another message.
           }
 
           /*
-           * =================================================
+           * ================================================
            * MODEL TURN
-           * =================================================
+           * ================================================
            */
 
           const modelTurn =
@@ -1684,9 +2128,6 @@ Do not wait for another message.
 
               /*
                * TEXT FALLBACK
-               *
-               * Some responses can contain
-               * text alongside audio.
                */
 
               if (
@@ -1700,9 +2141,9 @@ Do not wait for another message.
           }
 
           /*
-           * =================================================
+           * ================================================
            * INPUT TRANSCRIPTION
-           * =================================================
+           * ================================================
            */
 
           const inputTranscription =
@@ -1718,9 +2159,9 @@ Do not wait for another message.
           }
 
           /*
-           * =================================================
+           * ================================================
            * OUTPUT TRANSCRIPTION
-           * =================================================
+           * ================================================
            */
 
           const outputTranscription =
@@ -1736,9 +2177,9 @@ Do not wait for another message.
           }
 
           /*
-           * =================================================
+           * ================================================
            * TURN COMPLETE
-           * =================================================
+           * ================================================
            */
 
           if (
@@ -1786,11 +2227,6 @@ Do not wait for another message.
             modelTextFallbackRef.current =
               "";
 
-            /*
-             * Gemini has finished its turn.
-             * We are now listening for candidate.
-             */
-
             setIsSpeaking(false);
           }
         } catch (messageError) {
@@ -1814,6 +2250,14 @@ Do not wait for another message.
   /*
    * =========================================================
    * CONNECT GEMINI
+   *
+   * IMPORTANT:
+   *
+   * DO NOT create a new output AudioContext here.
+   *
+   * startRecording() already creates it.
+   *
+   * We MUST reuse the SAME context.
    * =========================================================
    */
 
@@ -1828,30 +2272,30 @@ Do not wait for another message.
       );
 
       /*
-       * Get server-created ephemeral token.
+       * Get ephemeral token.
        */
 
       const token =
         await getGeminiToken();
 
       /*
-       * Output AudioContext.
-       */
-
-      const outputContext =
-        new AudioContext({
-          sampleRate:
-            OUTPUT_SAMPLE_RATE,
-        });
-
-      outputAudioContextRef.current =
-        outputContext;
-
-      /*
        * IMPORTANT:
        *
-       * Constrained ephemeral-token
-       * WebSocket endpoint.
+       * We DO NOT create another AudioContext here.
+       *
+       * startRecording() already created:
+       *
+       * outputAudioContextRef.current
+       *
+       * Gemini playback will reuse it.
+       */
+
+      await getOutputAudioContext();
+
+      /*
+       * ================================================
+       * GEMINI LIVE WEBSOCKET
+       * ================================================
        */
 
       const wsUrl =
@@ -1872,13 +2316,6 @@ Do not wait for another message.
         console.log(
           "🔌 Gemini WebSocket connected."
         );
-
-        /*
-         * The token route already contains
-         * the constrained Live API configuration.
-         *
-         * Send only the model here.
-         */
 
         try {
           ws.send(
@@ -1941,11 +2378,6 @@ Do not wait for another message.
 
         wsRef.current = null;
 
-        /*
-         * If user intentionally ended the interview,
-         * do not treat it as an unexpected failure.
-         */
-
         if (
           isEndingRef.current
         ) {
@@ -1965,11 +2397,6 @@ Do not wait for another message.
             "error"
           );
 
-          /*
-           * Keep video upload and cleanup
-           * consistent even if Gemini disconnects.
-           */
-
           void endInterview(
             reason,
             false
@@ -1979,6 +2406,7 @@ Do not wait for another message.
     }, [
       endInterview,
       getGeminiToken,
+      getOutputAudioContext,
       handleGeminiMessage,
     ]);
 
@@ -2038,7 +2466,9 @@ Do not wait for another message.
         );
 
         /*
-         * Camera + microphone.
+         * ================================================
+         * CAMERA + MICROPHONE
+         * ================================================
          */
 
         const cameraStarted =
@@ -2058,13 +2488,19 @@ Do not wait for another message.
         }
 
         /*
-         * Start local video recording.
+         * ================================================
+         * START RECORDING FIRST
+         *
+         * This creates the ONE output AudioContext.
+         * ================================================
          */
 
-        startRecording();
+        await startRecording();
 
         /*
-         * Parent callback.
+         * ================================================
+         * PARENT CALLBACK
+         * ================================================
          */
 
         await onCallStart?.();
@@ -2073,10 +2509,11 @@ Do not wait for another message.
           true;
 
         /*
-         * Connect Gemini.
+         * ================================================
+         * CONNECT GEMINI
          *
-         * Microphone streaming itself starts
-         * only after Gemini setupComplete.
+         * It reuses the same AudioContext.
+         * ================================================
          */
 
         await connectGemini();
@@ -2104,7 +2541,7 @@ Do not wait for another message.
         );
 
         /*
-         * Stop recording if startup failed.
+         * Stop recorder if startup failed.
          */
 
         try {
@@ -2175,18 +2612,6 @@ Do not wait for another message.
       };
 
     const handleBlur = () => {
-      /*
-       * IMPORTANT:
-       *
-       * Blur alone does NOT end the interview.
-       *
-       * Clicking DevTools, browser controls,
-       * permission dialogs, etc. can cause blur.
-       *
-       * Actual security action is handled by
-       * visibilitychange.
-       */
-
       console.log(
         "Browser window lost focus."
       );
@@ -2338,9 +2763,7 @@ Do not wait for another message.
         className,
       ].join(" ")}
     >
-      {/* ===================================================
-          HEADER
-      =================================================== */}
+      {/* HEADER */}
 
       <div className="bg-gradient-to-r from-slate-950 via-slate-900 to-indigo-950 px-6 py-5 text-white">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -2396,9 +2819,7 @@ Do not wait for another message.
         </div>
       </div>
 
-      {/* ===================================================
-          SECURITY WARNING
-      =================================================== */}
+      {/* SECURITY WARNING */}
 
       {securityWarning && (
         <div className="border-b border-red-200 bg-red-50 px-6 py-4">
@@ -2420,9 +2841,7 @@ Do not wait for another message.
         </div>
       )}
 
-      {/* ===================================================
-          VIDEO
-      =================================================== */}
+      {/* VIDEO */}
 
       <div className="bg-slate-950 p-4 sm:p-6">
         <div className="relative aspect-video overflow-hidden rounded-2xl bg-slate-900 shadow-xl ring-1 ring-white/10">
@@ -2450,17 +2869,12 @@ Do not wait for another message.
             </div>
           )}
 
-          {/* Recording badge */}
-
           {isRecording && (
             <div className="absolute left-4 top-4 flex items-center gap-2 rounded-full bg-black/70 px-3 py-2 text-xs font-semibold text-white backdrop-blur">
               <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-red-500" />
-
               REC
             </div>
           )}
-
-          {/* AI speaking badge */}
 
           {isSpeaking && (
             <div className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full border border-white/10 bg-black/70 px-4 py-2 text-xs font-semibold text-white backdrop-blur">
@@ -2470,9 +2884,7 @@ Do not wait for another message.
         </div>
       </div>
 
-      {/* ===================================================
-          INTERVIEW REQUIREMENTS
-      =================================================== */}
+      {/* INTERVIEW REQUIREMENTS */}
 
       {!isInterviewActive &&
         !securityWarning && (
@@ -2500,9 +2912,7 @@ Do not wait for another message.
           </div>
         )}
 
-      {/* ===================================================
-          QUESTIONS PREVIEW
-      =================================================== */}
+      {/* QUESTIONS PREVIEW */}
 
       {questions.length > 0 &&
         !isInterviewActive &&
@@ -2533,9 +2943,7 @@ Do not wait for another message.
           </div>
         )}
 
-      {/* ===================================================
-          LIVE STATUS
-      =================================================== */}
+      {/* LIVE STATUS */}
 
       {isInterviewActive && (
         <div className="border-b border-slate-100 bg-gradient-to-r from-indigo-50 to-purple-50 px-6 py-4">
@@ -2564,8 +2972,6 @@ Do not wait for another message.
             )}
           </div>
 
-          {/* Voice visualizer */}
-
           <div className="mt-4 flex h-10 items-center justify-center gap-1.5 overflow-hidden">
             {Array.from({
               length: 28,
@@ -2592,9 +2998,7 @@ Do not wait for another message.
         </div>
       )}
 
-      {/* ===================================================
-          ERROR
-      =================================================== */}
+      {/* ERROR */}
 
       {error && (
         <div className="border-b border-red-100 bg-red-50 px-6 py-4">
@@ -2616,9 +3020,7 @@ Do not wait for another message.
         </div>
       )}
 
-      {/* ===================================================
-          UPLOAD STATUS
-      =================================================== */}
+      {/* UPLOAD STATUS */}
 
       {isUploading && (
         <div className="border-b border-indigo-100 bg-indigo-50 px-6 py-4">
@@ -2639,9 +3041,7 @@ Do not wait for another message.
         </div>
       )}
 
-      {/* ===================================================
-          UPLOAD SUCCESS
-      =================================================== */}
+      {/* UPLOAD SUCCESS */}
 
       {uploadedVideoUrl && (
         <div className="border-b border-emerald-100 bg-emerald-50 px-6 py-4">
@@ -2664,9 +3064,7 @@ Do not wait for another message.
         </div>
       )}
 
-      {/* ===================================================
-          TRANSCRIPT
-      =================================================== */}
+      {/* TRANSCRIPT */}
 
       {transcript.length > 0 && (
         <div className="border-b border-slate-100 px-6 py-5">
@@ -2724,9 +3122,7 @@ Do not wait for another message.
         </div>
       )}
 
-      {/* ===================================================
-          CONTROLS
-      =================================================== */}
+      {/* CONTROLS */}
 
       <div className="flex flex-col gap-3 bg-white px-6 py-6 sm:flex-row sm:items-center sm:justify-between">
         <div>
@@ -2765,9 +3161,9 @@ Do not wait for another message.
               disabled={
                 isConnecting ||
                 isUploading ||
-                connectionStatus ===
+                (connectionStatus ===
                   "error" &&
-                  securityViolationRef.current
+                  securityViolationRef.current)
               }
               className="inline-flex min-w-48 items-center justify-center gap-2 rounded-xl bg-slate-950 px-6 py-3.5 text-sm font-bold text-white shadow-lg transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
             >
@@ -2811,9 +3207,7 @@ Do not wait for another message.
         </div>
       </div>
 
-      {/* ===================================================
-          FOOTER INFO
-      =================================================== */}
+      {/* FOOTER */}
 
       <div className="border-t border-slate-100 bg-slate-50 px-6 py-4">
         <div className="flex flex-col gap-2 text-xs text-slate-500 sm:flex-row sm:items-center sm:justify-between">
@@ -2829,3 +3223,4 @@ Do not wait for another message.
     </div>
   );
 }
+
