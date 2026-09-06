@@ -185,6 +185,7 @@ export const callsRouter = createTRPCRouter({
         transcript: z.string(),
         duration: z.number().int().optional(),
         vapiCallId: z.string().optional(),
+        videoUrl: z.string().url().optional(),
       })
     )
     .mutation(async ({ ctx, input }) => {
@@ -220,6 +221,7 @@ export const callsRouter = createTRPCRouter({
           transcript: input.transcript,
           duration: input.duration,
           vapiCallId: input.vapiCallId,
+          videoUrl: input.videoUrl,
           status: "COMPLETED",
           endedAt: new Date(),
           ...reportData,

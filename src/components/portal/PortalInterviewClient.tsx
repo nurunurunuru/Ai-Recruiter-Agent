@@ -53,10 +53,18 @@ export function PortalInterviewClient({ candidateId }: { candidateId: string }) 
     }
   };
 
-  const handleCallComplete = (transcript: string) => {
-    if (!callId) return;
-    submitTranscript.mutate({ callId, transcript });
-  };
+  const handleCallComplete = (
+  transcript: string,
+  videoUrl?: string
+) => {
+  if (!callId) return;
+
+  submitTranscript.mutate({
+    callId,
+    transcript,
+    videoUrl,
+  });
+};
 
   if (isLoading) {
     return <div className="text-center py-12 text-sm text-gray-500">Loading...</div>;

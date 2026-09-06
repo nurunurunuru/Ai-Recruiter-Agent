@@ -298,6 +298,30 @@ function CandidatesContent() {
                       {candidate.calls?.[0]?.aiReport && (
                         <InterviewReportView report={JSON.parse(candidate.calls[0].aiReport)} />
                       )}
+                      {candidate.calls?.[0]?.videoUrl && (
+  <div
+    className="rounded-lg border border-gray-200 bg-gray-50 p-4"
+    onClick={(e) => e.stopPropagation()}
+  >
+    <div className="mb-3">
+      <p className="text-sm font-semibold text-gray-900">
+        Interview Recording
+      </p>
+      <p className="mt-1 text-xs text-gray-500">
+        Recorded video of the AI interview
+      </p>
+    </div>
+
+    <video
+      controls
+      preload="metadata"
+      src={candidate.calls[0].videoUrl}
+      className="w-full max-w-3xl rounded-lg bg-black"
+    >
+      Your browser does not support video playback.
+    </video>
+  </div>
+)}
 
                       <div className="flex flex-wrap items-center gap-2" onClick={(e) => e.stopPropagation()}>
                         {(candidate.status === "APPLIED" || candidate.status === "AI_REVIEWED") && (

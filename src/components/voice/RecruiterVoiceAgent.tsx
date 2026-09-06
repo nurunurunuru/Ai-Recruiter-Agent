@@ -14,7 +14,7 @@ interface RecruiterVoiceAgentProps {
   candidateName: string;
   jobTitle: string;
   questions?: string[];
-  onCallComplete?: (transcript: string) => void;
+  onCallComplete?: (transcript: string, videoUrl?: string) => void;
   onCallStart?: () => void | Promise<void>;
   onCallEnd?: () => void;
   onSecurityViolation?: (reason: string) => void;
@@ -1400,24 +1400,17 @@ Start the interview immediately when instructed.
            * Stop recording and upload video.
            */
 
-          await stopRecording();
+        const videoUrl = await stopRecording();
 
-          /*
-           * Generate transcript before
-           * cleaning everything.
-           */
+const finalTranscript =
+  generateFinalTranscript();
 
-          const finalTranscript =
-            generateFinalTranscript();
 
-          if (
-            finalTranscript.trim()
-              .length > 0
-          ) {
-            onCallComplete?.(
-              finalTranscript
-            );
-          }
+  onCallComplete?.(
+    finalTranscript,
+    videoUrl || undefined
+  );
+
 
           cleanupAudio();
 
